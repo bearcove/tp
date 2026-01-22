@@ -378,25 +378,47 @@ async fn crate_exists(client: &Client, name: &str) -> Result<bool> {
 async fn list_trustpub_github_configs(
     client: &Client,
     token: &str,
+    crates: &[Package],
 ) -> Result<Vec<GithubConfig>> {
-    let url = format!("{}/api/v1/trusted_publishing/github_configs", BASE_URL);
+    // Query configs for each crate in parallel
+    let results: Vec<_> = stream::iter(crates.iter().map(|pkg| {
+        let client = client;
+        let crate_name = &pkg.name;
+        async move {
+            let url = format!(
+                "{}/api/v1/trusted_publishing/github_configs?crate={}",
+                BASE_URL,
+                crate_name
+            );
 
-    let res = client
-        .get(&url)
-        .header("User-Agent", USER_AGENT)
-        .header("Authorization", token)
-        .send()
-        .await?;
+            let res = client
+                .get(&url)
+                .header("User-Agent", USER_AGENT)
+                .header("Authorization", token)
+                .send()
+                .await?;
 
-    if !res.status().is_success() {
-        let status = res.status();
-        let text = res.text().await?;
-        bail!("Failed to list configurations: {}: {}", status, text);
+            if !res.status().is_success() {
+                let status = res.status();
+                let text = res.text().await?;
+                bail!("Failed to list configurations for {}: {}: {}", crate_name, status, text);
+            }
+
+            let body = res.text().await?;
+            let response: GithubConfigListResponse = from_str(&body)?;
+            Ok::<_, color_eyre::eyre::Error>(response.github_configs)
+        }
+    }))
+    .buffer_unordered(20)
+    .collect()
+    .await;
+
+    // Flatten all configs into a single vector
+    let mut all_configs = Vec::new();
+    for result in results {
+        all_configs.extend(result?);
     }
-
-    let body = res.text().await?;
-    let response: GithubConfigListResponse = from_str(&body)?;
-    Ok(response.github_configs)
+    Ok(all_configs)
 }
 
 async fn create_trustpub_github_config(
@@ -542,7 +564,7 @@ async fn main() -> Result<()> {
 
     // List existing configurations from crates.io
     println!("\n{}", "🔍 Checking existing configurations...".cyan());
-    let existing_configs = list_trustpub_github_configs(&client, &token).await?;
+    let existing_configs = list_trustpub_github_configs(&client, &token, &packages).await?;
 
     // Build a set of already-configured (owner, repo, crate) tuples
     let already_configured: HashSet<(String, String, String)> = existing_configs
