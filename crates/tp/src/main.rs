@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::{Write, stdin, stdout};
 use std::process::Command;
 use std::time::Duration;
 
@@ -40,10 +41,14 @@ struct CargoMetadata {
     workspace_members: Vec<String>,
 }
 
-#[derive(Facet, Debug)]
+#[derive(Facet, Debug, Clone)]
 struct Package {
     name: String,
     id: String,
+    version: String,
+    description: Option<String>,
+    license: Option<String>,
+    repository: Option<String>,
     publish: Option<Vec<String>>,
 }
 
@@ -61,7 +66,7 @@ struct GithubConfigInner {
     workflow_filename: String,
 }
 
-fn get_publishable_crates() -> Result<Vec<String>> {
+fn get_publishable_crates() -> Result<Vec<Package>> {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version=1", "--no-deps"])
         .output()?;
@@ -81,7 +86,7 @@ fn get_publishable_crates() -> Result<Vec<String>> {
 
     let publishable = metadata
         .packages
-        .iter()
+        .into_iter()
         .filter(|pkg| {
             if !workspace_member_ids.contains(pkg.id.as_str()) {
                 return false;
@@ -91,10 +96,69 @@ fn get_publishable_crates() -> Result<Vec<String>> {
                 _ => true,
             }
         })
-        .map(|pkg| pkg.name.clone())
         .collect();
 
     Ok(publishable)
+}
+
+fn publish_skeleton(pkg: &Package, token: &str) -> Result<()> {
+    let tmp_dir = std::env::temp_dir().join(format!("tp-skeleton-{}", pkg.name));
+
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir)?;
+    }
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    let description = pkg.description.as_deref().unwrap_or("Placeholder for trusted publishing setup");
+    let license = pkg.license.as_deref().unwrap_or("MIT OR Apache-2.0");
+
+    let mut cargo_toml = format!(
+        r#"[package]
+name = "{}"
+version = "0.0.0"
+edition = "2021"
+description = "{}"
+license = "{}"
+"#,
+        pkg.name,
+        description.replace('"', r#"\""#),
+        license
+    );
+
+    if let Some(repo) = &pkg.repository {
+        cargo_toml.push_str(&format!("repository = \"{}\"\n", repo));
+    }
+
+    std::fs::write(tmp_dir.join("Cargo.toml"), cargo_toml)?;
+
+    let src_dir = tmp_dir.join("src");
+    std::fs::create_dir_all(&src_dir)?;
+    std::fs::write(src_dir.join("lib.rs"), "//! Placeholder crate for trusted publishing setup.\n")?;
+
+    let status = Command::new("cargo")
+        .args(["publish", "--allow-dirty"])
+        .env("CARGO_REGISTRY_TOKEN", token)
+        .current_dir(&tmp_dir)
+        .status()?;
+
+    std::fs::remove_dir_all(&tmp_dir)?;
+
+    if !status.success() {
+        bail!("cargo publish failed for {}", pkg.name);
+    }
+
+    Ok(())
+}
+
+fn ask_yes_no(prompt: &str) -> bool {
+    print!("{} [Y/n] ", prompt);
+    stdout().flush().unwrap();
+
+    let mut input = String::new();
+    stdin().read_line(&mut input).unwrap();
+    let input = input.trim().to_lowercase();
+
+    input.is_empty() || input == "y" || input == "yes"
 }
 
 async fn crate_exists(client: &Client, name: &str) -> Result<bool> {
@@ -142,10 +206,10 @@ async fn main() -> Result<()> {
     let token = std::env::var(&args.token_env)
         .map_err(|_| eyre!("Set {} environment variable", args.token_env))?;
 
-    let crates = get_publishable_crates()?;
-    println!("Found {} publishable crates\n", crates.len());
+    let packages = get_publishable_crates()?;
+    println!("Found {} publishable crates\n", packages.len());
 
-    if crates.is_empty() {
+    if packages.is_empty() {
         println!("No publishable crates found.");
         return Ok(());
     }
@@ -153,29 +217,47 @@ async fn main() -> Result<()> {
     let client = Client::new();
 
     println!("Checking which crates exist on crates.io...");
-    let mut unpublished = Vec::new();
-    for name in &crates {
-        if !crate_exists(&client, name).await? {
-            unpublished.push(name.as_str());
+    let mut unpublished: Vec<&Package> = Vec::new();
+    for pkg in &packages {
+        if !crate_exists(&client, &pkg.name).await? {
+            unpublished.push(pkg);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     if !unpublished.is_empty() {
-        eprintln!("\nThe following crates have never been published to crates.io:");
-        for name in &unpublished {
-            eprintln!("  - {}", name);
+        println!("\nThe following crates have never been published to crates.io:");
+        for pkg in &unpublished {
+            println!("  - {}", pkg.name);
         }
-        eprintln!(
-            "\nYou must publish these crates manually first before setting up trusted publishing."
-        );
-        std::process::exit(1);
+
+        if args.dry_run {
+            println!("\n(dry run) Would publish skeleton crates to reserve names");
+        } else if ask_yes_no("\nPublish skeleton crates to reserve these names?") {
+            println!();
+            for pkg in &unpublished {
+                print!("Publishing skeleton for {}... ", pkg.name);
+                stdout().flush().unwrap();
+                match publish_skeleton(pkg, &token) {
+                    Ok(()) => println!("✓"),
+                    Err(e) => {
+                        println!("✗ {}", e);
+                        bail!("Failed to publish skeleton for {}", pkg.name);
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            println!();
+        } else {
+            println!("\nAborting. Publish the crates manually or run again to create skeletons.");
+            std::process::exit(1);
+        }
+    } else {
+        println!("All crates exist on crates.io.\n");
     }
 
-    println!("All crates exist on crates.io.\n");
-
-    for crate_name in &crates {
-        print!("Configuring trusted publishing for {}... ", crate_name);
+    for pkg in &packages {
+        print!("Configuring trusted publishing for {}... ", pkg.name);
 
         if args.dry_run {
             println!("(dry run)");
@@ -184,7 +266,7 @@ async fn main() -> Result<()> {
 
         let config = GithubConfigRequest {
             github_config: GithubConfigInner {
-                crate_name: crate_name.clone(),
+                crate_name: pkg.name.clone(),
                 repository_owner: args.owner.clone(),
                 repository_name: args.repo.clone(),
                 workflow_filename: args.workflow.clone(),
