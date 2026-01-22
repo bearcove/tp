@@ -116,7 +116,7 @@ fn publish_skeleton(pkg: &Package, token: &str) -> Result<()> {
         r#"[package]
 name = "{}"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 description = "{}"
 license = "{}"
 "#,
