@@ -7,7 +7,7 @@ use std::time::Duration;
 use color_eyre::eyre::{bail, eyre, Result};
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use facet::Facet;
-use facet_args as args;
+use figue::{self as args, FigueBuiltins};
 use facet_json::{from_str, to_string};
 use futures::{StreamExt, stream};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -36,8 +36,12 @@ struct Args {
     token_env: Option<String>,
 
     /// Dry run - don't actually configure trusted publishing
-    #[facet(args::named, args::short = 'n')]
+    #[facet(args::named, args::short = 'n', default)]
     dry_run: bool,
+
+    /// Standard CLI options (--help, --version, --completions)
+    #[facet(flatten)]
+    builtins: FigueBuiltins,
 }
 
 fn detect_github_repo() -> Result<(String, String)> {
@@ -451,7 +455,7 @@ async fn create_trustpub_github_config(
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let args: Args = facet_args::from_std_args().map_err(|e| eyre!("{}", e))?;
+    let args: Args = figue::from_std_args().unwrap();
 
     // Print cache location upfront
     println!("{} {}\n", "📁 Cache:".dimmed(), get_cache_path().display().dimmed());

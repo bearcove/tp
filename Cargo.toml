@@ -9,9 +9,9 @@ repository = "https://github.com/bearcove/tp"
 
 [workspace.dependencies]
 facet = { git = "https://github.com/facet-rs/facet", branch = "main" }
-facet-args = { git = "https://github.com/facet-rs/facet", branch = "main" }
 facet-json = { git = "https://github.com/facet-rs/facet", branch = "main" }
 facet-toml = { git = "https://github.com/facet-rs/facet", branch = "main" }
+figue = { git = "https://github.com/bearcove/figue", branch = "main" }
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

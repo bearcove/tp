@@ -8,9 +8,9 @@ description = "Trusted publishing setup tool for Cargo workspaces"
 
 [dependencies]
 facet.workspace = true
-facet-args.workspace = true
 facet-json.workspace = true
 facet-toml.workspace = true
+figue.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 futures.workspace = true
