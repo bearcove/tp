@@ -35,6 +35,10 @@ struct Args {
     #[facet(args::named, args::short = 'e')]
     token_env: Option<String>,
 
+    /// Comma-separated crate names to configure instead of the whole workspace
+    #[facet(args::named, args::short = 'c')]
+    crates: Option<String>,
+
     /// Dry run - don't actually configure trusted publishing
     #[facet(args::named, args::short = 'n', default)]
     dry_run: bool,
@@ -273,6 +277,16 @@ fn get_publishable_crates() -> Result<Vec<Package>> {
     Ok(publishable)
 }
 
+fn parse_crate_filter(value: Option<&str>) -> HashSet<String> {
+    value
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn publish_skeleton(pkg: &Package, token: &str) -> Result<()> {
     let tmp_dir = std::env::temp_dir().join(format!("tp-skeleton-{}", pkg.name));
 
@@ -491,7 +505,27 @@ async fn main() -> Result<()> {
         read_token_from_credentials()?
     };
 
-    let packages = get_publishable_crates()?;
+    let mut packages = get_publishable_crates()?;
+    let requested_crates = parse_crate_filter(args.crates.as_deref());
+    if !requested_crates.is_empty() {
+        packages.retain(|pkg| requested_crates.contains(&pkg.name));
+        let found_crates: HashSet<&str> = packages.iter().map(|pkg| pkg.name.as_str()).collect();
+        let missing_crates: Vec<_> = requested_crates
+            .iter()
+            .filter(|name| !found_crates.contains(name.as_str()))
+            .collect();
+        if !missing_crates.is_empty() {
+            bail!(
+                "Requested crate{} not found in publishable workspace packages: {}",
+                if missing_crates.len() == 1 { "" } else { "s" },
+                missing_crates
+                    .iter()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
     println!(
         "📦 Found {} publishable crate{}\n",
         packages.len().to_string().bright_white().bold(),

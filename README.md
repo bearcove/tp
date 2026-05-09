@@ -29,6 +29,7 @@ tp <owner> <repo> [options]
 
 - `-w, --workflow <FILE>` - Workflow filename (default: "release-plz.yml")
 - `-e, --token-env <VAR>` - Environment variable for crates.io token (default: "CRATES_IO_TOKEN")
+- `-c, --crates <NAMES>` - Comma-separated crate names to configure instead of the whole workspace
 - `-n, --dry-run` - Don't actually configure trusted publishing, just show what would happen
 
 ### Example
@@ -42,6 +43,9 @@ tp facet-rs facet --dry-run
 
 # Use a different workflow file
 tp myorg myrepo --workflow ci.yml
+
+# Configure only selected crates
+tp bearcove arborium --workflow ci.yml --crates arborium-jsdoc,arborium-odin
 ```
 
 ## How it works
