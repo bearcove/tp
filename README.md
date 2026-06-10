@@ -30,6 +30,7 @@ tp <owner> <repo> [options]
 - `-w, --workflow <FILE>` - Workflow filename (default: "release-plz.yml")
 - `-e, --token-env <VAR>` - Environment variable for crates.io token (default: "CRATES_IO_TOKEN")
 - `-c, --crates <NAMES>` - Comma-separated crate names to configure instead of the whole workspace
+- `--manifest-path <PATH>` - Path to `Cargo.toml` when the Cargo workspace lives below the repository root. If omitted, `tp` reads `manifest_path` / `manifest-path` from the selected workflow when present.
 - `-n, --dry-run` - Don't actually configure trusted publishing, just show what would happen
 
 ### Example
@@ -46,6 +47,9 @@ tp myorg myrepo --workflow ci.yml
 
 # Configure only selected crates
 tp bearcove arborium --workflow ci.yml --crates arborium-jsdoc,arborium-odin
+
+# Configure a repository whose Rust workspace is in a subdirectory
+tp bearcove phon --workflow release-plz.yml --manifest-path rust/Cargo.toml
 ```
 
 ## How it works
