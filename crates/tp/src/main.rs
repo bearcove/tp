@@ -4,11 +4,11 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use color_eyre::eyre::{bail, eyre, Result};
+use color_eyre::eyre::{Result, bail, eyre};
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use facet::Facet;
-use figue::{self as args, FigueBuiltins};
 use facet_json::{from_str, to_string};
+use figue::{self as args, FigueBuiltins};
 use futures::{StreamExt, stream};
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
@@ -38,6 +38,10 @@ struct Args {
     /// Comma-separated crate names to configure instead of the whole workspace
     #[facet(args::named, args::short = 'c')]
     crates: Option<String>,
+
+    /// Path to Cargo.toml when the Cargo workspace is not rooted at the repository root
+    #[facet(args::named)]
+    manifest_path: Option<PathBuf>,
 
     /// Dry run - don't actually configure trusted publishing
     #[facet(args::named, args::short = 'n', default)]
@@ -111,12 +115,11 @@ fn detect_workflow_files() -> Result<Vec<String>> {
     for entry in std::fs::read_dir(&workflows_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if let Some(ext) = path.extension() {
-            if ext == "yml" || ext == "yaml" {
-                if let Some(name) = path.file_name() {
-                    files.push(name.to_string_lossy().to_string());
-                }
-            }
+        if let Some(ext) = path.extension()
+            && (ext == "yml" || ext == "yaml")
+            && let Some(name) = path.file_name()
+        {
+            files.push(name.to_string_lossy().to_string());
         }
     }
     files.sort();
@@ -146,6 +149,31 @@ fn select_workflow(files: &[String]) -> Result<String> {
         .interact()?;
 
     Ok(sorted[selection].clone())
+}
+
+fn detect_manifest_path_from_workflow(workflow: &str) -> Result<Option<PathBuf>> {
+    let path = PathBuf::from(".github/workflows").join(workflow);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let contents = std::fs::read_to_string(path)?;
+    for line in contents.lines() {
+        let trimmed = line.split('#').next().unwrap_or("").trim();
+        for key in ["manifest_path", "manifest-path"] {
+            if let Some(value) = trimmed
+                .strip_prefix(key)
+                .and_then(|rest| rest.trim_start().strip_prefix(':'))
+            {
+                let value = value.trim().trim_matches(['"', '\'']);
+                if !value.is_empty() && !value.starts_with("${{") {
+                    return Ok(Some(PathBuf::from(value)));
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 fn get_cache_path() -> PathBuf {
@@ -242,10 +270,13 @@ struct GithubConfig {
     workflow_filename: String,
 }
 
-fn get_publishable_crates() -> Result<Vec<Package>> {
-    let output = Command::new("cargo")
-        .args(["metadata", "--format-version=1", "--no-deps"])
-        .output()?;
+fn get_publishable_crates(manifest_path: Option<&PathBuf>) -> Result<Vec<Package>> {
+    let mut command = Command::new("cargo");
+    command.args(["metadata", "--format-version=1", "--no-deps"]);
+    if let Some(path) = manifest_path {
+        command.arg("--manifest-path").arg(path);
+    }
+    let output = command.output()?;
 
     if !output.status.success() {
         bail!(
@@ -257,8 +288,11 @@ fn get_publishable_crates() -> Result<Vec<Package>> {
     let stdout = String::from_utf8(output.stdout)?;
     let metadata: CargoMetadata = from_str(&stdout)?;
 
-    let workspace_member_ids: HashSet<&str> =
-        metadata.workspace_members.iter().map(|s| s.as_str()).collect();
+    let workspace_member_ids: HashSet<&str> = metadata
+        .workspace_members
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
 
     let publishable = metadata
         .packages
@@ -267,10 +301,7 @@ fn get_publishable_crates() -> Result<Vec<Package>> {
             if !workspace_member_ids.contains(pkg.id.as_str()) {
                 return false;
             }
-            match &pkg.publish {
-                Some(registries) if registries.is_empty() => false,
-                _ => true,
-            }
+            !matches!(&pkg.publish, Some(registries) if registries.is_empty())
         })
         .collect();
 
@@ -295,7 +326,10 @@ fn publish_skeleton(pkg: &Package, token: &str) -> Result<()> {
     }
     std::fs::create_dir_all(&tmp_dir)?;
 
-    let description = pkg.description.as_deref().unwrap_or("Placeholder for trusted publishing setup");
+    let description = pkg
+        .description
+        .as_deref()
+        .unwrap_or("Placeholder for trusted publishing setup");
     let license = pkg.license.as_deref().unwrap_or("MIT OR Apache-2.0");
 
     let mut cargo_toml = format!(
@@ -319,7 +353,10 @@ license = "{}"
 
     let src_dir = tmp_dir.join("src");
     std::fs::create_dir_all(&src_dir)?;
-    std::fs::write(src_dir.join("lib.rs"), "//! Placeholder crate for trusted publishing setup.\n")?;
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "//! Placeholder crate for trusted publishing setup.\n",
+    )?;
 
     let status = Command::new("cargo")
         .args(["publish", "--allow-dirty"])
@@ -400,13 +437,11 @@ async fn list_trustpub_github_configs(
 ) -> Result<Vec<GithubConfig>> {
     // Query configs for each crate in parallel
     let results: Vec<_> = stream::iter(crates.iter().map(|pkg| {
-        let client = client;
         let crate_name = &pkg.name;
         async move {
             let url = format!(
                 "{}/api/v1/trusted_publishing/github_configs?crate={}",
-                BASE_URL,
-                crate_name
+                BASE_URL, crate_name
             );
 
             let res = client
@@ -419,7 +454,12 @@ async fn list_trustpub_github_configs(
             if !res.status().is_success() {
                 let status = res.status();
                 let text = res.text().await?;
-                bail!("Failed to list configurations for {}: {}: {}", crate_name, status, text);
+                bail!(
+                    "Failed to list configurations for {}: {}: {}",
+                    crate_name,
+                    status,
+                    text
+                );
             }
 
             let body = res.text().await?;
@@ -472,7 +512,11 @@ async fn main() -> Result<()> {
     let args: Args = figue::from_std_args().unwrap();
 
     // Print cache location upfront
-    println!("{} {}\n", "📁 Cache:".dimmed(), get_cache_path().display().dimmed());
+    println!(
+        "{} {}\n",
+        "📁 Cache:".dimmed(),
+        get_cache_path().display().dimmed()
+    );
 
     let (owner, repo) = match (&args.owner, &args.repo) {
         (Some(o), Some(r)) => (o.clone(), r.clone()),
@@ -497,6 +541,18 @@ async fn main() -> Result<()> {
             w
         }
     };
+    let manifest_path = match &args.manifest_path {
+        Some(path) => Some(path.clone()),
+        None => detect_manifest_path_from_workflow(&workflow)?,
+    };
+
+    if let Some(path) = &manifest_path {
+        println!(
+            "{} {}",
+            "🧭 Manifest:".cyan(),
+            path.display().to_string().yellow()
+        );
+    }
     println!();
 
     let token = if let Some(env_var) = &args.token_env {
@@ -505,7 +561,7 @@ async fn main() -> Result<()> {
         read_token_from_credentials()?
     };
 
-    let mut packages = get_publishable_crates()?;
+    let mut packages = get_publishable_crates(manifest_path.as_ref())?;
     let requested_crates = parse_crate_filter(args.crates.as_deref());
     if !requested_crates.is_empty() {
         packages.retain(|pkg| requested_crates.contains(&pkg.name));
@@ -567,16 +623,24 @@ async fn main() -> Result<()> {
         .filter(|(_, exists)| !exists)
         .map(|(pkg, _)| pkg)
         .collect();
+    let unpublished_names: HashSet<&str> =
+        unpublished.iter().map(|pkg| pkg.name.as_str()).collect();
     pb.finish_and_clear();
 
     if !unpublished.is_empty() {
-        println!("\n{}", "⚠️  The following crates have never been published to crates.io:".yellow());
+        println!(
+            "\n{}",
+            "⚠️  The following crates have never been published to crates.io:".yellow()
+        );
         for pkg in &unpublished {
             println!("  {} {}", "•".dimmed(), pkg.name.bright_white());
         }
 
         if args.dry_run {
-            println!("\n{}", "(dry run) Would publish skeleton crates to reserve names".dimmed());
+            println!(
+                "\n{}",
+                "(dry run) Would publish skeleton crates to reserve names".dimmed()
+            );
         } else if ask_yes_no("Publish skeleton crates to reserve these names?") {
             println!();
             for pkg in &unpublished {
@@ -602,7 +666,13 @@ async fn main() -> Result<()> {
 
     // List existing configurations from crates.io
     println!("\n{}", "🔍 Checking existing configurations...".cyan());
-    let existing_configs = list_trustpub_github_configs(&client, &token, &packages).await?;
+    let config_lookup_packages: Vec<_> = packages
+        .iter()
+        .filter(|pkg| !args.dry_run || !unpublished_names.contains(pkg.name.as_str()))
+        .cloned()
+        .collect();
+    let existing_configs =
+        list_trustpub_github_configs(&client, &token, &config_lookup_packages).await?;
 
     // Build a set of already-configured (owner, repo, crate) tuples
     let already_configured: HashSet<(String, String, String)> = existing_configs
@@ -622,7 +692,9 @@ async fn main() -> Result<()> {
     // Filter out already-configured crates
     let to_configure: Vec<_> = packages
         .iter()
-        .filter(|pkg| !already_configured.contains(&(owner.clone(), repo.clone(), pkg.name.clone())))
+        .filter(|pkg| {
+            !already_configured.contains(&(owner.clone(), repo.clone(), pkg.name.clone()))
+        })
         .collect();
 
     if to_configure.is_empty() {
@@ -643,7 +715,12 @@ async fn main() -> Result<()> {
         to_configure.len().to_string().bright_white().bold(),
         if to_configure.len() == 1 { "" } else { "s" }
     );
-    println!("   {} {}/{}", "Repository:".dimmed(), owner.green(), repo.green());
+    println!(
+        "   {} {}/{}",
+        "Repository:".dimmed(),
+        owner.green(),
+        repo.green()
+    );
     println!("   {} {}", "Workflow:".dimmed(), workflow.yellow());
     println!("   {}", "Crates:".dimmed());
     for pkg in &to_configure {
@@ -652,7 +729,11 @@ async fn main() -> Result<()> {
     if packages.len() > to_configure.len() {
         println!(
             "   {}",
-            format!("({} crates already configured, skipped)", packages.len() - to_configure.len()).dimmed()
+            format!(
+                "({} crates already configured, skipped)",
+                packages.len() - to_configure.len()
+            )
+            .dimmed()
         );
     }
     println!();
@@ -699,10 +780,10 @@ async fn main() -> Result<()> {
     }
     pb.finish_and_clear();
 
-    if !args.dry_run {
-        if let Err(e) = save_cache(&cache) {
-            eprintln!("{} could not save cache: {}", "⚠️  Warning:".yellow(), e);
-        }
+    if !args.dry_run
+        && let Err(e) = save_cache(&cache)
+    {
+        eprintln!("{} could not save cache: {}", "⚠️  Warning:".yellow(), e);
     }
 
     if !errors.is_empty() {
