@@ -263,11 +263,20 @@ struct GithubConfigListResponse {
 
 #[derive(Facet, Debug)]
 struct GithubConfig {
+    id: u64,
     #[facet(rename = "crate")]
     crate_name: String,
     repository_owner: String,
     repository_name: String,
     workflow_filename: String,
+}
+
+impl GithubConfig {
+    fn matches(&self, owner: &str, repo: &str, workflow: &str) -> bool {
+        self.repository_owner == owner
+            && self.repository_name == repo
+            && self.workflow_filename == workflow
+    }
 }
 
 fn get_publishable_crates(manifest_path: Option<&PathBuf>) -> Result<Vec<Package>> {
@@ -505,6 +514,32 @@ async fn create_trustpub_github_config(
     Ok(())
 }
 
+async fn delete_trustpub_github_config(
+    client: &Client,
+    token: &str,
+    config: &GithubConfig,
+) -> Result<()> {
+    let url = format!(
+        "{}/api/v1/trusted_publishing/github_configs/{}",
+        BASE_URL, config.id
+    );
+
+    let res = client
+        .delete(&url)
+        .header("User-Agent", USER_AGENT)
+        .header("Authorization", token)
+        .send()
+        .await?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await?;
+        bail!("{}: {}", status, text);
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -674,17 +709,27 @@ async fn main() -> Result<()> {
     let existing_configs =
         list_trustpub_github_configs(&client, &token, &config_lookup_packages).await?;
 
-    // Build a set of already-configured (owner, repo, crate) tuples
-    let already_configured: HashSet<(String, String, String)> = existing_configs
-        .into_iter()
-        .map(|cfg| (cfg.repository_owner, cfg.repository_name, cfg.crate_name))
-        .collect();
+    let package_names: HashSet<&str> = packages.iter().map(|pkg| pkg.name.as_str()).collect();
+    let mut matching_configured = HashSet::new();
+    let mut mismatched_configs = Vec::new();
+
+    for cfg in existing_configs {
+        if !package_names.contains(cfg.crate_name.as_str()) {
+            continue;
+        }
+
+        if cfg.matches(&owner, &repo, &workflow) {
+            matching_configured.insert(cfg.crate_name.clone());
+        } else {
+            mismatched_configs.push(cfg);
+        }
+    }
 
     let mut cache = load_cache();
 
     // Update cache based on actual configurations from crates.io
     for pkg in &packages {
-        if already_configured.contains(&(owner.clone(), repo.clone(), pkg.name.clone())) {
+        if matching_configured.contains(&pkg.name) {
             cache.configured.insert(cache_key(&owner, &repo, &pkg.name));
         }
     }
@@ -692,10 +737,85 @@ async fn main() -> Result<()> {
     // Filter out already-configured crates
     let to_configure: Vec<_> = packages
         .iter()
-        .filter(|pkg| {
-            !already_configured.contains(&(owner.clone(), repo.clone(), pkg.name.clone()))
-        })
+        .filter(|pkg| !matching_configured.contains(&pkg.name))
         .collect();
+
+    if !mismatched_configs.is_empty() {
+        println!(
+            "\n{} Found {} mismatched trusted publishing config{}:",
+            "⚠️".yellow(),
+            mismatched_configs.len().to_string().bright_white().bold(),
+            if mismatched_configs.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+        for cfg in &mismatched_configs {
+            println!(
+                "   {} {}: {}/{} {} {}",
+                "•".dimmed(),
+                cfg.crate_name.cyan(),
+                cfg.repository_owner.red(),
+                cfg.repository_name.red(),
+                cfg.workflow_filename.red(),
+                format!("→ {}/{} {}", owner, repo, workflow).green()
+            );
+        }
+        println!();
+
+        if args.dry_run {
+            println!(
+                "{} Would delete {} mismatched config{} before configuring the desired publisher.",
+                "(dry run)".dimmed(),
+                mismatched_configs.len().to_string().bright_white(),
+                if mismatched_configs.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+        } else if !ask_yes_no("Replace mismatched trusted publishing configs?") {
+            println!("{}", "Aborted.".yellow());
+            return Ok(());
+        } else {
+            let pb = ProgressBar::new(mismatched_configs.len() as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{msg} [{bar:30}] {pos}/{len}")
+                    .unwrap()
+                    .progress_chars("=> "),
+            );
+
+            let mut delete_errors = Vec::new();
+            for cfg in &mismatched_configs {
+                pb.set_message(format!("Deleting {}", cfg.crate_name));
+                if let Err(e) = delete_trustpub_github_config(&client, &token, cfg).await {
+                    delete_errors.push((cfg.crate_name.clone(), e.to_string()));
+                } else {
+                    cache.configured.remove(&cache_key(
+                        &cfg.repository_owner,
+                        &cfg.repository_name,
+                        &cfg.crate_name,
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                pb.inc(1);
+            }
+            pb.finish_and_clear();
+
+            if !delete_errors.is_empty() {
+                println!(
+                    "\n{} Errors deleting trusted publishing configs:",
+                    "❌".red()
+                );
+                for (name, err) in &delete_errors {
+                    println!("   {} {} {}", name.cyan(), "✗".red(), err.dimmed());
+                }
+                bail!("Failed to delete mismatched trusted publishing configs");
+            }
+        }
+    }
 
     if to_configure.is_empty() {
         println!(

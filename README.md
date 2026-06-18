@@ -56,7 +56,9 @@ tp bearcove phon --workflow release-plz.yml --manifest-path rust/Cargo.toml
 
 1. Runs `cargo metadata` to discover all publishable crates in the workspace
 2. Checks that each crate has been published to crates.io at least once
-3. Configures trusted publishing via the crates.io API for each crate
+3. Lists existing trusted publishing configurations from crates.io
+4. Prompts to replace configurations that point at a different repository or workflow
+5. Configures trusted publishing via the crates.io API for each crate
 
 All crates must be published at least once before trusted publishing can be configured.
 
