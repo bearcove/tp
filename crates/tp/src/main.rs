@@ -789,7 +789,10 @@ async fn main() -> Result<()> {
 
             let mut delete_errors = Vec::new();
             for cfg in &mismatched_configs {
-                pb.set_message(format!("Deleting {}", cfg.crate_name));
+                pb.set_message(format!(
+                    "Deleting trusted publishing config for {}",
+                    cfg.crate_name
+                ));
                 if let Err(e) = delete_trustpub_github_config(&client, &token, cfg).await {
                     delete_errors.push((cfg.crate_name.clone(), e.to_string()));
                 } else {
