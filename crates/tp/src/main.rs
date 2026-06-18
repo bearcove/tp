@@ -741,6 +741,16 @@ async fn main() -> Result<()> {
         .collect();
 
     if !mismatched_configs.is_empty() {
+        let mismatched_crate_names: HashSet<&str> = mismatched_configs
+            .iter()
+            .map(|cfg| cfg.crate_name.as_str())
+            .collect();
+        let mismatched_crates_with_desired_config = mismatched_crate_names
+            .iter()
+            .filter(|name| matching_configured.contains(**name))
+            .count();
+        let crates_needing_desired_config = to_configure.len();
+
         println!(
             "\n{} Found {} mismatched trusted publishing config{}:",
             "⚠️".yellow(),
@@ -760,6 +770,53 @@ async fn main() -> Result<()> {
                 cfg.repository_name.red(),
                 cfg.workflow_filename.red(),
                 format!("→ {}/{} {}", owner, repo, workflow).green()
+            );
+        }
+        println!(
+            "   {} {}",
+            "Note:".dimmed(),
+            "these are stale trusted publishing configs; crates themselves are not deleted."
+                .dimmed()
+        );
+        if mismatched_crates_with_desired_config > 0 {
+            println!(
+                "   {} {} affected crate{} already {} the desired config; only the stale config{} will be removed.",
+                "Note:".dimmed(),
+                mismatched_crates_with_desired_config
+                    .to_string()
+                    .bright_white(),
+                if mismatched_crates_with_desired_config == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                if mismatched_crates_with_desired_config == 1 {
+                    "has"
+                } else {
+                    "have"
+                },
+                if mismatched_crates_with_desired_config == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+        }
+        if crates_needing_desired_config > 0 {
+            println!(
+                "   {} {} crate{} still need{} the desired config and will be configured next.",
+                "Note:".dimmed(),
+                crates_needing_desired_config.to_string().bright_white(),
+                if crates_needing_desired_config == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                if crates_needing_desired_config == 1 {
+                    "s"
+                } else {
+                    ""
+                }
             );
         }
         println!();
